@@ -85,6 +85,22 @@ h1, h2, h3, p, ul, ol { margin: 0; }
 ul { list-style: none; padding: 0; }
 button, input, textarea, select { font: inherit; color: inherit; }
 
+/* Все иконки — это <svg viewBox="0 0 24 24"> из UI.icon(). Задаём им размер и
+   обводку по умолчанию: без явных размеров svg разворачивается до размера
+   replaced-элемента (сотни пикселей) и выдавливает соседний текст за край.
+   Специфичность минимальная, поэтому .btn svg, .chevron и прочие правила
+   компонентов продолжают работать. */
+svg {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .app {
   display: flex;
   flex-direction: column;
@@ -797,9 +813,17 @@ button, input, textarea, select { font: inherit; color: inherit; }
 
 .toast {
   position: fixed;
-  left: 50%;
+  /* left/right: 0 + margin: auto вместо left: 50% + translate(-50%):
+     при left: 50% ширина «по содержимому» считается от половины экрана,
+     и длинные сообщения об ошибках сжимались в узкую колонку. */
+  left: 0;
+  right: 0;
   bottom: calc(24px + var(--safe-bottom));
   z-index: 200;
+  width: -webkit-fit-content;
+  width: fit-content;
+  margin: 0 auto;
+  max-width: 90vw;
   max-width: min(90vw, 420px);
   padding: 12px 18px;
   border-radius: 14px;
@@ -809,13 +833,13 @@ button, input, textarea, select { font: inherit; color: inherit; }
   font-weight: 550;
   text-align: center;
   box-shadow: var(--shadow-lg);
-  transform: translate(-50%, 20px);
+  transform: translateY(20px);
   opacity: 0;
   pointer-events: none;
   transition: opacity .2s, transform .2s;
 }
 
-.toast.is-visible { opacity: 1; transform: translate(-50%, 0); }
+.toast.is-visible { opacity: 1; transform: translateY(0); }
 .toast--error { background: var(--danger); }
 
 @media (prefers-color-scheme: dark) {
