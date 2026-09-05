@@ -2,10 +2,17 @@
  * db.js — обёртка над IndexedDB.
  *
  * Хранилища:
- *   decks    { id, name, createdAt, updatedAt, cardIds[] }   — cardIds задаёт порядок карточек
+ *   decks    { id, name, direction, createdAt, updatedAt, cardIds[] }
+ *              direction: forward (термин -> определение) | reverse | both
  *   cards    { id, deckId, term, definition, image, createdAt, updatedAt }
- *   progress { cardId, deckId, interval, easeFactor, repetitions, lapses, dueDate, lastReviewed }
- *   reviews  { id++, cardId, deckId, rating, quality, interval, date, ts }
+ *   progress { cardId, card, dir, deckId, interval, easeFactor, repetitions,
+ *              lapses, dueDate, lastReviewed }
+ *              У каждой карточки две независимо планируемые стороны.
+ *              cardId — ключ записи: «<id>» для прямой стороны и «<id>|r» для
+ *              обратной; поле card всегда хранит настоящий id карточки, dir —
+ *              сторону ('f' или 'r'). Записи, созданные до появления обратных
+ *              карточек, лишены card/dir и достраиваются в normalizeProgress().
+ *   reviews  { id++, cardId, dir, deckId, rating, quality, interval, date, ts }
  *   meta     { key, value }
  */
 (function (global) {
@@ -51,6 +58,37 @@
   /** Сколько дней от a до b (b - a). */
   function daysBetween(a, b) {
     return Math.round((strToDate(b) - strToDate(a)) / 86400000);
+  }
+
+  /* ------------------------------------------------------- стороны карточек */
+
+  var DIRECTIONS = { forward: ['f'], reverse: ['r'], both: ['f', 'r'] };
+
+  /** Какие стороны карточек изучаются в наборе: ['f'], ['r'] или обе. */
+  function directionsOf(deck) {
+    return DIRECTIONS[(deck && deck.direction) || 'forward'] || DIRECTIONS.forward;
+  }
+
+  /** Ключ записи прогресса для стороны карточки. */
+  function progressKey(cardId, dir) {
+    return dir === 'r' ? cardId + '|r' : cardId;
+  }
+
+  /** Достраивает card/dir у записей, сохранённых до появления обратных карточек. */
+  function normalizeProgress(p) {
+    if (!p) return p;
+    if (!p.dir) p.dir = 'f';
+    if (!p.card) {
+      p.card = p.dir === 'r' ? String(p.cardId).replace(/\|r$/, '') : p.cardId;
+    }
+    return p;
+  }
+
+  /** Оставляет только записи изучаемых сторон. */
+  function filterByDirs(progressList, dirs) {
+    return progressList.map(normalizeProgress).filter(function (p) {
+      return dirs.indexOf(p.dir) !== -1;
+    });
   }
 
   /* ------------------------------------------------------------ соединение */
@@ -146,10 +184,11 @@
     });
   }
 
-  function createDeck(name) {
+  function createDeck(name, direction) {
     var deck = {
       id: uid(),
       name: String(name || 'Без названия').trim() || 'Без названия',
+      direction: DIRECTIONS[direction] ? direction : 'forward',
       createdAt: Date.now(),
       updatedAt: Date.now(),
       cardIds: []
@@ -169,6 +208,50 @@
         deck.updatedAt = Date.now();
         s.decks.put(deck);
         done(deck);
+      };
+    });
+  }
+
+  /** Меняет изучаемые стороны набора и досоздаёт недостающие записи прогресса. */
+  function setDeckDirection(deckId, direction) {
+    var value = DIRECTIONS[direction] ? direction : 'forward';
+    return withTx(['decks'], 'readwrite', function (s, done) {
+      s.decks.get(deckId).onsuccess = function (e) {
+        var deck = e.target.result;
+        if (!deck) throw new Error('Набор не найден');
+        deck.direction = value;
+        deck.updatedAt = Date.now();
+        s.decks.put(deck);
+        done(deck);
+      };
+    }).then(function (deck) {
+      return ensureProgress(deckId).then(function () { return deck; });
+    });
+  }
+
+  /**
+   * Досоздаёт записи прогресса для обеих сторон каждой карточки.
+   * Нужен для наборов, созданных до появления обратных карточек; если всё на
+   * месте, не пишет ничего.
+   */
+  function ensureProgress(deckId) {
+    return withTx(['cards', 'progress'], 'readwrite', function (s, done) {
+      s.cards.index('by_deck').getAll(IDBKeyRange.only(deckId)).onsuccess = function (e) {
+        var cards = e.target.result;
+        s.progress.index('by_deck').getAllKeys(IDBKeyRange.only(deckId)).onsuccess = function (ev) {
+          var have = {};
+          ev.target.result.forEach(function (key) { have[key] = true; });
+          var created = 0;
+          cards.forEach(function (card) {
+            ['f', 'r'].forEach(function (dir) {
+              if (!have[progressKey(card.id, dir)]) {
+                s.progress.put(newProgressRecord(card.id, deckId, dir));
+                created++;
+              }
+            });
+          });
+          done(created);
+        };
       };
     });
   }
@@ -193,9 +276,12 @@
 
   /* -------------------------------------------------------------- карточки */
 
-  function newProgressRecord(cardId, deckId) {
+  function newProgressRecord(cardId, deckId, dir) {
+    var d = dir === 'r' ? 'r' : 'f';
     return {
-      cardId: cardId,
+      cardId: progressKey(cardId, d),
+      card: cardId,
+      dir: d,
       deckId: deckId,
       interval: 0,
       easeFactor: 2.5,
@@ -248,7 +334,8 @@
     return withTx(['decks', 'cards', 'progress'], 'readwrite', function (s, done) {
       items.forEach(function (card) {
         s.cards.put(card);
-        s.progress.put(newProgressRecord(card.id, deckId));
+        s.progress.put(newProgressRecord(card.id, deckId, 'f'));
+        s.progress.put(newProgressRecord(card.id, deckId, 'r'));
       });
       s.decks.get(deckId).onsuccess = function (e) {
         var deck = e.target.result;
@@ -284,7 +371,8 @@
         var card = e.target.result;
         if (!card) return done(false);
         s.cards.delete(cardId);
-        s.progress.delete(cardId);
+        s.progress.delete(progressKey(cardId, 'f'));
+        s.progress.delete(progressKey(cardId, 'r'));
         s.decks.get(card.deckId).onsuccess = function (ev) {
           var deck = ev.target.result;
           if (!deck) return;
@@ -302,14 +390,16 @@
   function getDeckProgress(deckId) {
     return withTx('progress', 'readonly', function (s, done) {
       s.progress.index('by_deck').getAll(IDBKeyRange.only(deckId)).onsuccess = function (e) {
-        done(e.target.result);
+        done(e.target.result.map(normalizeProgress));
       };
     });
   }
 
   function getAllProgress() {
     return withTx('progress', 'readonly', function (s, done) {
-      s.progress.getAll().onsuccess = function (e) { done(e.target.result); };
+      s.progress.getAll().onsuccess = function (e) {
+        done(e.target.result.map(normalizeProgress));
+      };
     });
   }
 
@@ -325,7 +415,8 @@
     return withTx(['progress', 'cards'], 'readwrite', function (s, done) {
       s.cards.index('by_deck').getAll(IDBKeyRange.only(deckId)).onsuccess = function (e) {
         e.target.result.forEach(function (card) {
-          s.progress.put(newProgressRecord(card.id, deckId));
+          s.progress.put(newProgressRecord(card.id, deckId, 'f'));
+          s.progress.put(newProgressRecord(card.id, deckId, 'r'));
         });
         done(true);
       };
@@ -337,6 +428,7 @@
   function recordReview(entry) {
     var row = {
       cardId: entry.cardId,
+      dir: entry.dir === 'r' ? 'r' : 'f',
       deckId: entry.deckId,
       rating: entry.rating,
       quality: entry.quality,
@@ -395,8 +487,10 @@
     return sum;
   }
 
-  function deckSummary(deckId) {
-    return getDeckProgress(deckId).then(summarize);
+  function deckSummary(deckId, deck) {
+    return getDeckProgress(deckId).then(function (list) {
+      return summarize(filterByDirs(list, directionsOf(deck)));
+    });
   }
 
   /* ------------------------------------------------------- meta / сервисы */
@@ -452,6 +546,7 @@
       idMap[d.id] = id;
       return {
         id: id, name: d.name || 'Без названия',
+        direction: DIRECTIONS[d.direction] ? d.direction : 'forward',
         createdAt: d.createdAt || Date.now(), updatedAt: Date.now(), cardIds: []
       };
     });
@@ -475,10 +570,13 @@
       var d = deckById[c.deckId];
       if (d.cardIds.indexOf(c.id) === -1) d.cardIds.push(c.id);
     });
-    var progress = (data.progress || []).filter(function (p) { return cardMap[p.cardId]; })
+    var progress = (data.progress || []).map(normalizeProgress)
+      .filter(function (p) { return cardMap[p.card]; })
       .map(function (p) {
+        var card = cardMap[p.card];
         return {
-          cardId: cardMap[p.cardId], deckId: idMap[p.deckId],
+          cardId: progressKey(card, p.dir), card: card, dir: p.dir,
+          deckId: idMap[p.deckId],
           interval: p.interval || 0, easeFactor: p.easeFactor || 2.5,
           repetitions: p.repetitions || 0, lapses: p.lapses || 0,
           dueDate: p.dueDate || today(), lastReviewed: p.lastReviewed || null
@@ -487,12 +585,17 @@
     var haveProgress = {};
     progress.forEach(function (p) { haveProgress[p.cardId] = true; });
     cards.forEach(function (c) {
-      if (!haveProgress[c.id]) progress.push(newProgressRecord(c.id, c.deckId));
+      ['f', 'r'].forEach(function (dir) {
+        if (!haveProgress[progressKey(c.id, dir)]) {
+          progress.push(newProgressRecord(c.id, c.deckId, dir));
+        }
+      });
     });
     var reviews = (data.reviews || []).filter(function (r) { return cardMap[r.cardId]; })
       .map(function (r) {
         return {
-          cardId: cardMap[r.cardId], deckId: idMap[r.deckId], rating: r.rating,
+          cardId: cardMap[r.cardId], dir: r.dir === 'r' ? 'r' : 'f',
+          deckId: idMap[r.deckId], rating: r.rating,
           quality: r.quality, interval: r.interval, date: r.date, ts: r.ts || Date.now()
         };
       });
@@ -529,6 +632,12 @@
     getDeck: getDeck,
     createDeck: createDeck,
     renameDeck: renameDeck,
+    setDeckDirection: setDeckDirection,
+    ensureProgress: ensureProgress,
+    directionsOf: directionsOf,
+    progressKey: progressKey,
+    normalizeProgress: normalizeProgress,
+    filterByDirs: filterByDirs,
     deleteDeck: deleteDeck,
     listCards: listCards,
     addCards: addCards,

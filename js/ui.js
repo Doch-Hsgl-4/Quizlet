@@ -340,6 +340,54 @@
   }
 
   /* ================================================================
+     Стороны карточек (прямые и обратные)
+     ================================================================ */
+
+  var DIRECTION_LABELS = {
+    forward: 'Термин → определение',
+    reverse: 'Определение → термин',
+    both: 'Обе стороны'
+  };
+
+  var DIRECTION_SHORT = { forward: 'прямые', reverse: 'обратные', both: 'обе стороны' };
+
+  /** Что показывается на лицевой стороне: термин ('f') или определение ('r'). */
+  function frontOf(card, dir) { return dir === 'r' ? card.definition : card.term; }
+  function backOf(card, dir) { return dir === 'r' ? card.term : card.definition; }
+  function frontKicker(dir) { return dir === 'r' ? 'определение' : 'термин'; }
+  function backKicker(dir) { return dir === 'r' ? 'термин' : 'определение'; }
+
+  /** Уникальный ключ элемента обучения (у сторон одной карточки он разный). */
+  function itemKey(item) { return DB.progressKey(item.card.id, item.dir); }
+
+  /**
+   * Элементы обучения набора: по одному на каждую изучаемую сторону карточки.
+   * У сторон независимые интервалы, поэтому элемент несёт свою запись прогресса.
+   */
+  function buildItems(cardList, progressList, dirs) {
+    var byId = {};
+    cardList.forEach(function (c) { byId[c.id] = c; });
+    return DB.filterByDirs(progressList, dirs)
+      .filter(function (p) { return byId[p.card]; })
+      .map(function (p) { return { card: byId[p.card], dir: p.dir, progress: p }; });
+  }
+
+  /** Шторка выбора изучаемых сторон набора. */
+  function directionDialog(deck) {
+    return actionSheet('Какие стороны учить', [
+      { label: DIRECTION_LABELS.forward + (deck.direction === 'forward' ? ' ✓' : ''), value: 'forward' },
+      { label: DIRECTION_LABELS.reverse + (deck.direction === 'reverse' ? ' ✓' : ''), value: 'reverse' },
+      { label: DIRECTION_LABELS.both + (deck.direction === 'both' ? ' ✓' : ''), value: 'both' }
+    ]).then(function (choice) {
+      if (!choice || choice === (deck.direction || 'forward')) return false;
+      return DB.setDeckDirection(deck.id, choice).then(function () {
+        toast('Стороны: ' + DIRECTION_SHORT[choice]);
+        return true;
+      });
+    });
+  }
+
+  /* ================================================================
      Переиспользуемые блоки
      ================================================================ */
 
@@ -577,12 +625,35 @@
     var body = el('<div class="stack">' +
       '<div class="field"><label class="field__label">Название</label>' +
       '<input class="input" type="text" placeholder="Английский — базовый" data-name></div>' +
+      '<div class="field"><label class="field__label">Какие стороны учить</label>' +
+      '<div class="segmented" data-direction>' +
+      '<button type="button" data-value="forward">Прямые</button>' +
+      '<button type="button" data-value="reverse">Обратные</button>' +
+      '<button type="button" data-value="both">Обе</button>' +
+      '</div>' +
+      '<span class="small muted" data-direction-hint></span></div>' +
       '<div class="field"><label class="field__label">Карточки (необязательно)</label>' +
       '<textarea class="textarea textarea--code" rows="5" placeholder="apple - яблоко&#10;book - книга" data-text></textarea>' +
       '<span class="small muted">Одна строка — одна карточка: «термин - определение» или через табуляцию.</span>' +
       '</div></div>');
     var nameEl = $('[data-name]', body);
     var textEl = $('[data-text]', body);
+    var direction = 'forward';
+    var DIR_HINTS = {
+      forward: 'Показываем термин, вспоминаем определение.',
+      reverse: 'Показываем определение, вспоминаем термин.',
+      both: 'Обе стороны с раздельными интервалами — карточек к повторению вдвое больше.'
+    };
+    function syncDirection() {
+      $$('[data-direction] button', body).forEach(function (b) {
+        b.classList.toggle('is-active', b.getAttribute('data-value') === direction);
+      });
+      $('[data-direction-hint]', body).textContent = DIR_HINTS[direction];
+    }
+    $$('[data-direction] button', body).forEach(function (b) {
+      on(b, 'click', function () { direction = b.getAttribute('data-value'); syncDirection(); });
+    });
+    syncDirection();
 
     return modal({
       title: 'Новый набор',
@@ -597,7 +668,7 @@
             var name = nameEl.value.trim();
             if (!name) { toast('Введите название', 'error'); return false; }
             var parsed = parseCardsText(textEl.value);
-            DB.createDeck(name).then(function (deck) {
+            DB.createDeck(name, direction).then(function (deck) {
               if (!parsed.items.length) return deck;
               return DB.addCards(deck.id, parsed.items).then(function () { return deck; });
             }).then(function (deck) {
@@ -636,6 +707,7 @@
   function deckMenu(deck, list) {
     return actionSheet(deck.name, [
       { label: 'Переименовать', value: 'rename' },
+      { label: 'Стороны карточек', value: 'direction' },
       { label: 'Импорт из текста', value: 'import' },
       { label: 'Экспорт в текст', value: 'export' },
       { label: 'Сбросить прогресс', value: 'reset' },
@@ -654,6 +726,8 @@
               return true;
             });
           });
+        case 'direction':
+          return directionDialog(deck);
         case 'import':
           return showImportDialog(deck.id).then(function (n) { return n > 0; });
         case 'export':
@@ -708,9 +782,11 @@
       });
 
       var root = el('<div class="stack"></div>');
+      var sums = {};
       var totalDue = 0;
       decks.forEach(function (d) {
-        totalDue += DB.summarize(byDeck[d.id] || []).due;
+        sums[d.id] = DB.summarize(DB.filterByDirs(byDeck[d.id] || [], DB.directionsOf(d)));
+        totalDue += sums[d.id].due;
       });
 
       if (!decks.length) {
@@ -749,11 +825,15 @@
       root.appendChild(el('<div class="section-title">Наборы</div>'));
       var list = el('<div class="card list"></div>');
       decks.forEach(function (deck) {
-        var sum = DB.summarize(byDeck[deck.id] || []);
+        var sum = sums[deck.id];
+        // карточек в наборе — по числу прямых сторон (у каждой карточки она одна)
+        var cardCount = (byDeck[deck.id] || []).filter(function (p) { return p.dir !== 'r'; }).length;
+        var direction = deck.direction || 'forward';
         var row = el('<div class="list__row">' +
           '<div class="list__main">' +
           '<div class="list__title">' + esc(deck.name) + '</div>' +
-          '<div class="list__sub">' + cards(sum.total) +
+          '<div class="list__sub">' + cards(cardCount) +
+          (direction === 'forward' ? '' : ' · ' + DIRECTION_SHORT[direction]) +
           (sum.mature ? ' · выучено ' + sum.mature : '') +
           (sum.fresh ? ' · новых ' + sum.fresh : '') + '</div>' +
           '</div>' +
@@ -797,24 +877,32 @@
      ================================================================ */
 
   function screenDeck(deckId) {
-    return Promise.all([
-      DB.getDeck(deckId),
-      DB.listCards(deckId),
-      DB.getDeckProgress(deckId)
-    ]).then(function (res) {
+    return DB.ensureProgress(deckId).then(function () {
+      return Promise.all([DB.getDeck(deckId), DB.listCards(deckId), DB.getDeckProgress(deckId)]);
+    }).then(function (res) {
       var deck = res[0], list = res[1], progress = res[2];
       if (!deck) return notFound();
-      var sum = DB.summarize(progress);
+      var direction = deck.direction || 'forward';
+      var dirs = DB.directionsOf(deck);
+      var sum = DB.summarize(DB.filterByDirs(progress, dirs));
       var root = el('<div class="stack"></div>');
 
       var banner = el('<div class="banner">' +
         '<div class="banner__value">' + sum.due + '</div>' +
         '<div class="grow"><div style="font-weight:650">' +
         (sum.due ? 'к повторению сегодня' : 'на сегодня всё готово') + '</div>' +
-        '<div class="banner__text">' + cards(sum.total) + ' в наборе</div></div></div>');
+        '<div class="banner__text">' + cards(list.length) + ' в наборе' +
+        (dirs.length > 1 ? ' · обе стороны' : (direction === 'reverse' ? ' · обратные' : '')) +
+        '</div></div></div>');
       root.appendChild(banner);
 
-      if (sum.total) root.appendChild(statGrid(sum));
+      if (sum.total) {
+        root.appendChild(statGrid(sum));
+        if (dirs.length > 1) {
+          root.appendChild(el('<p class="small muted center">Счёт по сторонам: ' + list.length +
+            ' × 2 = ' + sum.total + '. У прямой и обратной стороны свои интервалы.</p>'));
+        }
+      }
 
       var learnBtn = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
         icon('bolt') + ' Учить' + (sum.due ? ' · ' + sum.due : '') + '</button>');
@@ -841,6 +929,14 @@
 
       root.appendChild(el('<div class="section-title">Содержимое</div>'));
       var menu = el('<div class="card list"></div>');
+      var dirRow = el('<div class="list__row"><div class="list__main">' +
+        '<div class="list__title">Стороны карточек</div>' +
+        '<div class="list__sub">' + esc(DIRECTION_LABELS[direction]) + '</div></div>' +
+        '<svg viewBox="0 0 24 24" class="chevron" aria-hidden="true"><path d="' + ICONS.forward + '"/></svg></div>');
+      on(dirRow, 'click', function () {
+        directionDialog(deck).then(function (changed) { if (changed) App.refresh(); });
+      });
+      menu.appendChild(dirRow);
       var cardsRow = el('<div class="list__row"><div class="list__main">' +
         '<div class="list__title">Карточки набора</div>' +
         '<div class="list__sub">Добавить, изменить, удалить</div></div>' +
@@ -1032,15 +1128,19 @@
     return map;
   }
 
-  /** Сохраняет оценку карточки: прогресс + запись в журнал. */
-  function applyRating(deckId, card, progress, rating) {
-    var base = progress || DB.newProgressRecord(card.id, deckId);
-    base.cardId = card.id;
+  /** Сохраняет оценку стороны карточки: прогресс + запись в журнал. */
+  function applyRating(deckId, item, rating) {
+    var base = item.progress || DB.newProgressRecord(item.card.id, deckId, item.dir);
+    base.cardId = DB.progressKey(item.card.id, item.dir);
+    base.card = item.card.id;
+    base.dir = item.dir;
     base.deckId = deckId;
     var next = SRS.schedule(base, rating);
-    DB.putProgress(next).catch(function (e) { toast('Не удалось сохранить прогресс', 'error'); });
+    item.progress = next;
+    DB.putProgress(next).catch(function () { toast('Не удалось сохранить прогресс', 'error'); });
     DB.recordReview({
-      cardId: card.id,
+      cardId: item.card.id,
+      dir: item.dir,
       deckId: deckId,
       rating: rating,
       quality: SRS.QUALITY[rating],
@@ -1050,19 +1150,19 @@
   }
 
   function screenFlashcards(deckId) {
-    return Promise.all([
-      DB.getDeck(deckId), DB.listCards(deckId), DB.getDeckProgress(deckId)
-    ]).then(function (res) {
+    return DB.ensureProgress(deckId).then(function () {
+      return Promise.all([DB.getDeck(deckId), DB.listCards(deckId), DB.getDeckProgress(deckId)]);
+    }).then(function (res) {
       var deck = res[0], list = res[1];
       if (!deck) return notFound();
       if (!list.length) return emptyStudy(deckId, 'В наборе нет карточек', 'Добавьте карточки, чтобы начать.');
 
-      var progressMap = progressMapOf(res[2]);
-      var queue = shuffle(list);
+      var dirs = DB.directionsOf(deck);
+      var queue = shuffle(buildItems(list, res[2], dirs));
       var index = 0;
       var requeued = {};
       var score = { known: 0, unknown: 0 };
-      var wrongCards = [];
+      var wrong = [];
       var flipped = false;
 
       var root = el('<div class="study"></div>');
@@ -1071,15 +1171,15 @@
         '<div class="progress"><div class="progress__bar"></div></div></div>');
       var fc = el('<div class="flashcard"><div class="flashcard__inner">' +
         '<div class="flashcard__face flashcard__face--front">' +
-        '<div class="flashcard__kicker">термин</div>' +
-        '<div class="flashcard__text" data-term></div>' +
+        '<div class="flashcard__kicker" data-front-kicker></div>' +
+        '<div class="flashcard__text" data-front></div>' +
         '<div class="flashcard__hint">Нажмите, чтобы перевернуть</div>' +
         '<div class="swipe-badge swipe-badge--yes">помню</div>' +
         '<div class="swipe-badge swipe-badge--no">не помню</div>' +
         '</div>' +
         '<div class="flashcard__face flashcard__face--back">' +
-        '<div class="flashcard__kicker">определение</div>' +
-        '<div class="flashcard__text flashcard__text--answer" data-def></div>' +
+        '<div class="flashcard__kicker" data-back-kicker></div>' +
+        '<div class="flashcard__text flashcard__text--answer" data-back></div>' +
         '<img class="flashcard__img" data-img alt="" hidden>' +
         '<div class="flashcard__hint">Свайп влево — не помню, вправо — помню</div>' +
         '</div></div></div>');
@@ -1099,32 +1199,35 @@
       function current() { return queue[index]; }
 
       function render() {
-        var card = current();
-        if (!card) return finish();
+        var item = current();
+        if (!item) return finish();
         flipped = false;
         fc.classList.remove('is-flipped');
         inner.style.transform = '';
         inner.style.opacity = '';
-        $('[data-term]', fc).textContent = card.term;
-        $('[data-def]', fc).textContent = card.definition;
+        $('[data-front-kicker]', fc).textContent = frontKicker(item.dir);
+        $('[data-back-kicker]', fc).textContent = backKicker(item.dir);
+        $('[data-front]', fc).textContent = frontOf(item.card, item.dir);
+        $('[data-back]', fc).textContent = backOf(item.card, item.dir);
         var img = $('[data-img]', fc);
-        if (card.image) { img.src = card.image; img.hidden = false; } else { img.hidden = true; img.removeAttribute('src'); }
+        if (item.card.image) { img.src = item.card.image; img.hidden = false; }
+        else { img.hidden = true; img.removeAttribute('src'); }
         $('[data-pos]', head).textContent = 'Карточка ' + (index + 1) + ' из ' + queue.length;
         $('[data-score]', head).textContent = '✓ ' + score.known + '   ✗ ' + score.unknown;
         $('.progress__bar', head).style.width = (index / queue.length * 100) + '%';
       }
 
       function answer(known) {
-        var card = current();
-        if (!card) return;
-        var rating = known ? 'good' : 'again';
-        progressMap[card.id] = applyRating(deckId, card, progressMap[card.id], rating);
+        var item = current();
+        if (!item) return;
+        applyRating(deckId, item, known ? 'good' : 'again');
         if (known) {
           score.known++;
         } else {
           score.unknown++;
-          if (wrongCards.indexOf(card) === -1) wrongCards.push(card);
-          if (!requeued[card.id]) { requeued[card.id] = true; queue.push(card); }
+          if (wrong.indexOf(item) === -1) wrong.push(item);
+          var key = itemKey(item);
+          if (!requeued[key]) { requeued[key] = true; queue.push(item); }
         }
         index++;
         render();
@@ -1156,12 +1259,12 @@
           '<div class="muted small">помню: ' + score.known + ' · не помню: ' + score.unknown + '</div>' +
           '</div>');
         root.appendChild(summary);
-        if (wrongCards.length) {
+        if (wrong.length) {
           var again = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
-            'Повторить сложные (' + wrongCards.length + ')</button>');
+            'Повторить сложные (' + wrong.length + ')</button>');
           on(again, 'click', function () {
-            queue = shuffle(wrongCards);
-            wrongCards = [];
+            queue = shuffle(wrong);
+            wrong = [];
             requeued = {};
             index = 0;
             score = { known: 0, unknown: 0 };
@@ -1259,21 +1362,21 @@
      ================================================================ */
 
   function screenLearn(deckId) {
-    return Promise.all([
-      DB.getDeck(deckId), DB.listCards(deckId), DB.getDeckProgress(deckId)
-    ]).then(function (res) {
+    return DB.ensureProgress(deckId).then(function () {
+      return Promise.all([DB.getDeck(deckId), DB.listCards(deckId), DB.getDeckProgress(deckId)]);
+    }).then(function (res) {
       var deck = res[0], list = res[1];
       if (!deck) return notFound();
       if (!list.length) return emptyStudy(deckId, 'В наборе нет карточек', 'Добавьте карточки, чтобы начать.');
 
-      var progressMap = progressMapOf(res[2]);
+      var dirs = DB.directionsOf(deck);
+      var items = buildItems(list, res[2], dirs);
       var today = DB.today();
-      var due = list.filter(function (c) { return SRS.isDue(progressMap[c.id], today); });
+      var due = items.filter(function (it) { return SRS.isDue(it.progress, today); });
 
       if (!due.length) {
-        var next = list.map(function (c) {
-          return progressMap[c.id] && progressMap[c.id].dueDate;
-        }).filter(Boolean).sort()[0];
+        var next = items.map(function (it) { return it.progress && it.progress.dueDate; })
+          .filter(Boolean).sort()[0];
         var hint = next
           ? 'Следующее повторение — ' + next + ' (через ' + DB.daysBetween(today, next) + ' дн.).'
           : 'Возвращайтесь позже.';
@@ -1298,7 +1401,7 @@
       var queue = shuffle(due);
       var total = due.length;
       var index = 0;
-      var doneIds = {};
+      var doneKeys = {};
       var doneCount = 0;
       var againCount = 0;
       var revealed = false;
@@ -1309,13 +1412,13 @@
         '<div class="progress"><div class="progress__bar"></div></div></div>');
       var card = el('<div class="flashcard"><div class="flashcard__inner">' +
         '<div class="flashcard__face flashcard__face--front">' +
-        '<div class="flashcard__kicker">термин</div>' +
-        '<div class="flashcard__text" data-term></div>' +
+        '<div class="flashcard__kicker" data-front-kicker></div>' +
+        '<div class="flashcard__text" data-front></div>' +
         '<div class="flashcard__hint">Вспомните ответ и нажмите «Показать»</div>' +
         '</div>' +
         '<div class="flashcard__face flashcard__face--back">' +
-        '<div class="flashcard__kicker" data-term-small></div>' +
-        '<div class="flashcard__text flashcard__text--answer" data-def></div>' +
+        '<div class="flashcard__kicker" data-front-small></div>' +
+        '<div class="flashcard__text flashcard__text--answer" data-back></div>' +
         '<img class="flashcard__img" data-img alt="" hidden>' +
         '</div></div></div>');
       var showBtn = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
@@ -1338,19 +1441,22 @@
       function current() { return queue[index]; }
 
       function render() {
-        var c = current();
-        if (!c) return finish();
+        var item = current();
+        if (!item) return finish();
         revealed = false;
         card.classList.remove('is-flipped');
         showBtn.hidden = false;
         ratings.hidden = true;
-        $('[data-term]', card).textContent = c.term;
-        $('[data-term-small]', card).textContent = c.term;
-        $('[data-def]', card).textContent = c.definition;
+        var front = frontOf(item.card, item.dir);
+        $('[data-front-kicker]', card).textContent = frontKicker(item.dir);
+        $('[data-front]', card).textContent = front;
+        $('[data-front-small]', card).textContent = front;
+        $('[data-back]', card).textContent = backOf(item.card, item.dir);
         var img = $('[data-img]', card);
-        if (c.image) { img.src = c.image; img.hidden = false; } else { img.hidden = true; img.removeAttribute('src'); }
+        if (item.card.image) { img.src = item.card.image; img.hidden = false; }
+        else { img.hidden = true; img.removeAttribute('src'); }
 
-        var p = progressMap[c.id] || DB.newProgressRecord(c.id, deckId);
+        var p = item.progress || DB.newProgressRecord(item.card.id, deckId, item.dir);
         $$('[data-rating]', ratings).forEach(function (btn) {
           var rating = btn.getAttribute('data-rating');
           $('[data-interval]', btn).textContent = SRS.formatInterval(SRS.previewInterval(p, rating));
@@ -1370,15 +1476,16 @@
       }
 
       function rate(rating) {
-        var c = current();
-        if (!c || !revealed) return;
-        progressMap[c.id] = applyRating(deckId, c, progressMap[c.id], rating);
+        var item = current();
+        if (!item || !revealed) return;
+        applyRating(deckId, item, rating);
+        var key = itemKey(item);
         if (rating === 'again') {
           againCount++;
-          // вернуть карточку в конец ближайшей очереди (но не сразу следующей)
-          queue.splice(Math.min(index + 3, queue.length), 0, c);
-        } else if (!doneIds[c.id]) {
-          doneIds[c.id] = true;
+          // вернуть карточку в очередь, но не следующей же
+          queue.splice(Math.min(index + 3, queue.length), 0, item);
+        } else if (!doneKeys[key]) {
+          doneKeys[key] = true;
           doneCount++;
         }
         index++;
@@ -1461,16 +1568,29 @@
       if (!list.length) return emptyStudy(deckId, 'В наборе нет карточек', 'Добавьте карточки, чтобы пройти тест.');
 
       var root = el('<div class="stack"></div>');
-      var settings = { type: 'mixed', count: Math.min(10, list.length) };
+      var deckDirection = deck.direction || 'forward';
+      // «ask» — что показывать в вопросе: термин (ответ — определение),
+      // определение (ответ — термин) или вперемешку.
+      var settings = {
+        type: 'mixed',
+        count: Math.min(10, list.length),
+        ask: deckDirection === 'reverse' ? 'definition' : (deckDirection === 'both' ? 'mixed' : 'term')
+      };
+
+      function dirFor() {
+        if (settings.ask === 'mixed') return Math.random() < 0.5 ? 'f' : 'r';
+        return settings.ask === 'definition' ? 'r' : 'f';
+      }
 
       function buildQuestions() {
         var pool = shuffle(list).slice(0, settings.count);
         return pool.map(function (card) {
+          var dir = dirFor();
           var kind = settings.type === 'mixed' ? (Math.random() < 0.5 ? 'choice' : 'written') : settings.type;
           if (kind === 'choice' && list.length < 3) kind = 'written';
-          if (kind !== 'choice') return { card: card, kind: 'written' };
+          if (kind !== 'choice') return { card: card, dir: dir, kind: 'written' };
           var others = shuffle(list.filter(function (c) { return c.id !== card.id; })).slice(0, 3);
-          return { card: card, kind: 'choice', options: shuffle([card].concat(others)) };
+          return { card: card, dir: dir, kind: 'choice', options: shuffle([card].concat(others)) };
         });
       }
 
@@ -1483,6 +1603,13 @@
         settings.count = Math.min(settings.count, list.length);
 
         var box = el('<div class="stack">' +
+          '<div class="section-title">Что в вопросе</div>' +
+          '<div class="segmented" data-ask>' +
+          '<button type="button" data-value="term">Термин</button>' +
+          '<button type="button" data-value="definition">Определение</button>' +
+          '<button type="button" data-value="mixed">Вперемешку</button>' +
+          '</div>' +
+          '<p class="small muted" data-ask-hint></p>' +
           '<div class="section-title">Тип вопросов</div>' +
           '<div class="segmented" data-type>' +
           '<button type="button" data-value="mixed">Смешанный</button>' +
@@ -1498,14 +1625,27 @@
             (n === list.length ? 'все (' + n + ')' : n) + '</button>'));
         });
 
+        var ASK_HINTS = {
+          term: 'Показываем термин — ответить нужно определением.',
+          definition: 'Показываем определение — ответить нужно термином (например, слово по-русски, а написать по-английски).',
+          mixed: 'Стороны чередуются случайно.'
+        };
+
         function syncSegments() {
+          $$('[data-ask] button', box).forEach(function (b) {
+            b.classList.toggle('is-active', b.getAttribute('data-value') === settings.ask);
+          });
           $$('[data-type] button', box).forEach(function (b) {
             b.classList.toggle('is-active', b.getAttribute('data-value') === settings.type);
           });
           $$('[data-count] button', box).forEach(function (b) {
             b.classList.toggle('is-active', +b.getAttribute('data-value') === settings.count);
           });
+          $('[data-ask-hint]', box).textContent = ASK_HINTS[settings.ask];
         }
+        $$('[data-ask] button', box).forEach(function (b) {
+          on(b, 'click', function () { settings.ask = b.getAttribute('data-value'); syncSegments(); });
+        });
         $$('[data-type] button', box).forEach(function (b) {
           on(b, 'click', function () { settings.type = b.getAttribute('data-value'); syncSegments(); });
         });
@@ -1540,9 +1680,10 @@
             (index / questions.length * 100) + '%"></div></div></div>');
           root.appendChild(head);
 
+          var action = q.kind === 'choice' ? 'выберите ' : 'напишите ';
           var question = el('<div class="question">' +
-            '<div class="question__kicker">' + (q.kind === 'choice' ? 'выберите определение' : 'напишите определение') + '</div>' +
-            '<div class="question__text">' + esc(q.card.term) + '</div></div>');
+            '<div class="question__kicker">' + action + backKicker(q.dir) + '</div>' +
+            '<div class="question__text">' + esc(frontOf(q.card, q.dir)) + '</div></div>');
           root.appendChild(question);
 
           if (q.kind === 'choice') renderChoice(q);
@@ -1551,7 +1692,7 @@
 
         function proceed(isCorrect, q, given) {
           if (isCorrect) correct++;
-          else mistakes.push({ term: q.card.term, expected: q.card.definition, given: given });
+          else mistakes.push({ prompt: frontOf(q.card, q.dir), expected: backOf(q.card, q.dir), given: given });
           var next = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
             (index === questions.length - 1 ? 'Показать результат' : 'Далее') + '</button>');
           on(next, 'click', function () { index++; renderQuestion(); });
@@ -1563,7 +1704,7 @@
           var box = el('<div class="options"></div>');
           q.options.forEach(function (option) {
             var btn = el('<button type="button" class="option"><span class="option__mark"></span>' +
-              '<span class="grow">' + esc(option.definition) + '</span></button>');
+              '<span class="grow">' + esc(backOf(option, q.dir)) + '</span></button>');
             on(btn, 'click', function () {
               var isCorrect = option.id === q.card.id;
               $$('.option', box).forEach(function (b) { b.classList.add('option--disabled'); });
@@ -1577,7 +1718,7 @@
                   }
                 });
               }
-              proceed(isCorrect, q, option.definition);
+              proceed(isCorrect, q, backOf(option, q.dir));
             });
             box.appendChild(btn);
           });
@@ -1594,13 +1735,14 @@
           on(form, 'submit', function (e) {
             e.preventDefault();
             var value = input.value;
-            var isCorrect = answerMatches(value, q.card.definition);
+            var expected = backOf(q.card, q.dir);
+            var isCorrect = answerMatches(value, expected);
             input.disabled = true;
             $('button', form).remove();
             var verdict = el('<div class="verdict ' + (isCorrect ? 'verdict--ok' : 'verdict--no') + '">' +
               icon(isCorrect ? 'check' : 'close') +
               '<span class="grow">' + (isCorrect ? 'Верно!' : 'Правильный ответ: <span class="verdict__answer">' +
-                esc(q.card.definition) + '</span>') + '</span></div>');
+                esc(expected) + '</span>') + '</span></div>');
             root.insertBefore(verdict, form.nextSibling);
             proceed(isCorrect, q, value.trim() || '—');
           });
@@ -1622,7 +1764,7 @@
             var list2 = el('<div class="card list"></div>');
             mistakes.forEach(function (m) {
               list2.appendChild(el('<div class="list__row list__row--static"><div class="list__main">' +
-                '<div class="list__title">' + esc(m.term) + '</div>' +
+                '<div class="list__title">' + esc(m.prompt) + '</div>' +
                 '<div class="list__sub">Правильно: ' + esc(m.expected) + '</div>' +
                 '<div class="list__sub">Вы ответили: ' + esc(m.given) + '</div>' +
                 '</div></div>'));
@@ -1752,10 +1894,17 @@
       DB.reviewDates()
     ]).then(function (res) {
       var decks = res[0], progress = res[1], reviews = res[2], totalReviews = res[3], dates = res[4];
-      var sum = DB.summarize(progress);
+      var byDeck = {};
+      progress.forEach(function (p) { (byDeck[p.deckId] = byDeck[p.deckId] || []).push(p); });
+      // в общий счёт идут только те стороны, которые в наборе действительно учат
+      var studied = [];
+      decks.forEach(function (deck) {
+        studied = studied.concat(DB.filterByDirs(byDeck[deck.id] || [], DB.directionsOf(deck)));
+      });
+      var sum = DB.summarize(studied);
       var root = el('<div class="stack"></div>');
 
-      if (!progress.length) {
+      if (!studied.length) {
         root.appendChild(emptyState({
           icon: 'chart',
           title: 'Пока нет данных',
@@ -1797,15 +1946,15 @@
 
       if (decks.length) {
         root.appendChild(el('<div class="section-title">По наборам</div>'));
-        var byDeck = {};
-        progress.forEach(function (p) { (byDeck[p.deckId] = byDeck[p.deckId] || []).push(p); });
         var list = el('<div class="card list"></div>');
         decks.forEach(function (deck) {
-          var s = DB.summarize(byDeck[deck.id] || []);
+          var s = DB.summarize(DB.filterByDirs(byDeck[deck.id] || [], DB.directionsOf(deck)));
+          var dirNote = (deck.direction && deck.direction !== 'forward')
+            ? ' · ' + DIRECTION_SHORT[deck.direction] : '';
           var row = el('<div class="list__row"><div class="list__main">' +
             '<div class="list__title">' + esc(deck.name) + '</div>' +
             '<div class="list__sub">выучено ' + s.mature + ' · изучаю ' + s.learning +
-            ' · новых ' + s.fresh + '</div></div>' +
+            ' · новых ' + s.fresh + dirNote + '</div></div>' +
             (s.due ? '<span class="badge badge--due">' + s.due + '</span>' : '') +
             '<svg viewBox="0 0 24 24" class="chevron" aria-hidden="true"><path d="' + ICONS.forward + '"/></svg></div>');
           on(row, 'click', function () { App.go('#/deck/' + deck.id); });
@@ -1864,6 +2013,11 @@
     saveTextFile: saveTextFile,
     createSampleDeck: createSampleDeck,
     showNewDeckDialog: showNewDeckDialog,
+    directionDialog: directionDialog,
+    buildItems: buildItems,
+    frontOf: frontOf,
+    backOf: backOf,
+    DIRECTION_LABELS: DIRECTION_LABELS,
     screens: {
       home: screenHome,
       deck: screenDeck,

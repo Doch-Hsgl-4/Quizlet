@@ -6,7 +6,7 @@
  * правок в HTML/CSS/JS нужно поднять номер версии ниже.
  */
 
-var CACHE_VERSION = 'v1.0.0';
+var CACHE_VERSION = 'v1.1.0';
 var CACHE_NAME = 'flashcards-' + CACHE_VERSION;
 
 var ASSETS = [

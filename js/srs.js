@@ -84,6 +84,8 @@
 
     return {
       cardId: p.cardId,
+      card: p.card,
+      dir: p.dir,
       deckId: p.deckId,
       interval: interval,
       easeFactor: ef,
