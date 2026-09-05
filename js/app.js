@@ -4,7 +4,7 @@
 (function (global) {
   'use strict';
 
-  var VERSION = '1.1.1';
+  var VERSION = '1.2.0';
 
   var ROUTES = [
     { re: /^\/?$/, screen: function () { return UI.screens.home(); } },

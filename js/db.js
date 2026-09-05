@@ -2,8 +2,9 @@
  * db.js — обёртка над IndexedDB.
  *
  * Хранилища:
- *   decks    { id, name, direction, createdAt, updatedAt, cardIds[] }
+ *   decks    { id, name, direction, learnMode, createdAt, updatedAt, cardIds[] }
  *              direction: forward (термин -> определение) | reverse | both
+ *              learnMode: quiz (приложение проверяет ответ) | self (самооценка)
  *   cards    { id, deckId, term, definition, image, createdAt, updatedAt }
  *   progress { cardId, card, dir, deckId, interval, easeFactor, repetitions,
  *              lapses, dueDate, lastReviewed }
@@ -189,6 +190,7 @@
       id: uid(),
       name: String(name || 'Без названия').trim() || 'Без названия',
       direction: DIRECTIONS[direction] ? direction : 'forward',
+      learnMode: 'quiz',
       createdAt: Date.now(),
       updatedAt: Date.now(),
       cardIds: []
@@ -200,11 +202,18 @@
   }
 
   function renameDeck(id, name) {
-    return withTx('decks', 'readwrite', function (s, done) {
-      s.decks.get(id).onsuccess = function (e) {
+    return updateDeck(id, { name: name });
+  }
+
+  /** Меняет настройки набора (name, direction, learnMode). */
+  function updateDeck(deckId, patch) {
+    return withTx(['decks'], 'readwrite', function (s, done) {
+      s.decks.get(deckId).onsuccess = function (e) {
         var deck = e.target.result;
         if (!deck) throw new Error('Набор не найден');
-        deck.name = String(name).trim() || deck.name;
+        if (patch.name) deck.name = String(patch.name).trim() || deck.name;
+        if (patch.direction && DIRECTIONS[patch.direction]) deck.direction = patch.direction;
+        if (patch.learnMode) deck.learnMode = patch.learnMode === 'self' ? 'self' : 'quiz';
         deck.updatedAt = Date.now();
         s.decks.put(deck);
         done(deck);
@@ -212,19 +221,14 @@
     });
   }
 
+  function setDeckLearnMode(deckId, mode) {
+    return updateDeck(deckId, { learnMode: mode });
+  }
+
   /** Меняет изучаемые стороны набора и досоздаёт недостающие записи прогресса. */
   function setDeckDirection(deckId, direction) {
-    var value = DIRECTIONS[direction] ? direction : 'forward';
-    return withTx(['decks'], 'readwrite', function (s, done) {
-      s.decks.get(deckId).onsuccess = function (e) {
-        var deck = e.target.result;
-        if (!deck) throw new Error('Набор не найден');
-        deck.direction = value;
-        deck.updatedAt = Date.now();
-        s.decks.put(deck);
-        done(deck);
-      };
-    }).then(function (deck) {
+    return updateDeck(deckId, { direction: DIRECTIONS[direction] ? direction : 'forward' })
+      .then(function (deck) {
       return ensureProgress(deckId).then(function () { return deck; });
     });
   }
@@ -477,13 +481,18 @@
   /** Считает статистику по массиву прогресса: новые / изучаю / выучено / к повтору. */
   function summarize(progressList) {
     var t = today();
-    var sum = { total: progressList.length, fresh: 0, learning: 0, mature: 0, due: 0 };
+    var mature = (global.SRS && global.SRS.MATURE_INTERVAL) || 21;
+    var sum = { total: progressList.length, fresh: 0, learning: 0, mature: 0, due: 0, mastery: 0 };
+    var masterySum = 0;
     progressList.forEach(function (p) {
       if (!p.lastReviewed) sum.fresh++;
-      else if ((p.interval || 0) > 21) sum.mature++;
+      else if ((p.interval || 0) > mature) sum.mature++;
       else sum.learning++;
       if (!p.dueDate || p.dueDate <= t) sum.due++;
+      // освоенность стороны: интервал в долях «взрослого» (21 день)
+      masterySum += Math.min(p.interval || 0, mature) / mature;
     });
+    sum.mastery = progressList.length ? Math.round(masterySum / progressList.length * 100) : 0;
     return sum;
   }
 
@@ -547,6 +556,7 @@
       return {
         id: id, name: d.name || 'Без названия',
         direction: DIRECTIONS[d.direction] ? d.direction : 'forward',
+        learnMode: d.learnMode === 'self' ? 'self' : 'quiz',
         createdAt: d.createdAt || Date.now(), updatedAt: Date.now(), cardIds: []
       };
     });
@@ -632,7 +642,9 @@
     getDeck: getDeck,
     createDeck: createDeck,
     renameDeck: renameDeck,
+    updateDeck: updateDeck,
     setDeckDirection: setDeckDirection,
+    setDeckLearnMode: setDeckLearnMode,
     ensureProgress: ensureProgress,
     directionsOf: directionsOf,
     progressKey: progressKey,

@@ -387,6 +387,26 @@
     });
   }
 
+  var LEARN_MODE_LABELS = {
+    quiz: 'Проверка ответов',
+    self: 'Самооценка (снова / трудно / хорошо / легко)'
+  };
+
+  /** Шторка выбора режима обучения набора. */
+  function learnModeDialog(deck) {
+    var current = deck.learnMode === 'self' ? 'self' : 'quiz';
+    return actionSheet('Как проходит обучение', [
+      { label: LEARN_MODE_LABELS.quiz + (current === 'quiz' ? ' ✓' : ''), value: 'quiz' },
+      { label: LEARN_MODE_LABELS.self + (current === 'self' ? ' ✓' : ''), value: 'self' }
+    ]).then(function (choice) {
+      if (!choice || choice === current) return false;
+      return DB.setDeckLearnMode(deck.id, choice).then(function () {
+        toast(choice === 'quiz' ? 'Приложение будет проверять ответы' : 'Оценивать себя будете сами');
+        return true;
+      });
+    });
+  }
+
   /* ================================================================
      Переиспользуемые блоки
      ================================================================ */
@@ -708,6 +728,7 @@
     return actionSheet(deck.name, [
       { label: 'Переименовать', value: 'rename' },
       { label: 'Стороны карточек', value: 'direction' },
+      { label: 'Режим «Учить»', value: 'learnMode' },
       { label: 'Импорт из текста', value: 'import' },
       { label: 'Экспорт в текст', value: 'export' },
       { label: 'Сбросить прогресс', value: 'reset' },
@@ -728,6 +749,8 @@
           });
         case 'direction':
           return directionDialog(deck);
+        case 'learnMode':
+          return learnModeDialog(deck);
         case 'import':
           return showImportDialog(deck.id).then(function (n) { return n > 0; });
         case 'export':
@@ -905,8 +928,8 @@
       }
 
       var learnBtn = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
-        icon('bolt') + ' Учить' + (sum.due ? ' · ' + sum.due : '') + '</button>');
-      if (!sum.due) learnBtn.disabled = true;
+        icon('bolt') + (sum.due ? ' Учить · ' + sum.due : ' Учить досрочно') + '</button>');
+      if (!sum.total) learnBtn.disabled = true;
       on(learnBtn, 'click', function () { App.go('#/deck/' + deckId + '/learn'); });
       root.appendChild(learnBtn);
 
@@ -921,11 +944,22 @@
       root.appendChild(grid);
 
       if (!sum.due && sum.total) {
-        root.appendChild(el('<p class="small muted center">Новых повторений на сегодня нет — ' +
-          'можно просто пролистать набор в режиме «Карточки».</p>'));
+        root.appendChild(el('<p class="small muted center">На сегодня всё повторено. ' +
+          'Досрочная тренировка не сбивает расписание: правильные ответы не приближают ' +
+          'следующий показ.</p>'));
       }
 
-      if (sum.total) root.appendChild(splitBar(sum));
+      if (sum.total) {
+        var mastery = el('<div class="card card--pad stack">' +
+          '<div class="row"><div class="grow list__title">Освоение набора</div>' +
+          '<div class="mastery__value">' + sum.mastery + '%</div></div>' +
+          '<div class="progress progress--lg"><div class="progress__bar" style="width:' +
+          sum.mastery + '%"></div></div>' +
+          '<p class="small muted">100% — когда все стороны выходят на интервал ' +
+          SRS.MATURE_INTERVAL + ' дней и больше.</p></div>');
+        mastery.appendChild(splitBar(sum));
+        root.appendChild(mastery);
+      }
 
       root.appendChild(el('<div class="section-title">Содержимое</div>'));
       var menu = el('<div class="card list"></div>');
@@ -937,6 +971,16 @@
         directionDialog(deck).then(function (changed) { if (changed) App.refresh(); });
       });
       menu.appendChild(dirRow);
+
+      var learnMode = deck.learnMode === 'self' ? 'self' : 'quiz';
+      var modeRow = el('<div class="list__row"><div class="list__main">' +
+        '<div class="list__title">Режим «Учить»</div>' +
+        '<div class="list__sub">' + esc(LEARN_MODE_LABELS[learnMode]) + '</div></div>' +
+        '<svg viewBox="0 0 24 24" class="chevron" aria-hidden="true"><path d="' + ICONS.forward + '"/></svg></div>');
+      on(modeRow, 'click', function () {
+        learnModeDialog(deck).then(function (changed) { if (changed) App.refresh(); });
+      });
+      menu.appendChild(modeRow);
       var cardsRow = el('<div class="list__row"><div class="list__main">' +
         '<div class="list__title">Карточки набора</div>' +
         '<div class="list__sub">Добавить, изменить, удалить</div></div>' +
@@ -1129,13 +1173,19 @@
   }
 
   /** Сохраняет оценку стороны карточки: прогресс + запись в журнал. */
-  function applyRating(deckId, item, rating) {
+  function applyRating(deckId, item, rating, opts) {
     var base = item.progress || DB.newProgressRecord(item.card.id, deckId, item.dir);
     base.cardId = DB.progressKey(item.card.id, item.dir);
     base.card = item.card.id;
     base.dir = item.dir;
     base.deckId = deckId;
     var next = SRS.schedule(base, rating);
+    // Досрочная тренировка не должна приближать следующий показ: если карточка
+    // была запланирована на потом и отвечена верно, оставляем дальнюю дату.
+    if (opts && opts.keepLaterDue && rating !== 'again' &&
+        base.dueDate && base.dueDate > next.dueDate) {
+      next.dueDate = base.dueDate;
+    }
     item.progress = next;
     DB.putProgress(next).catch(function () { toast('Не удалось сохранить прогресс', 'error'); });
     DB.recordReview({
@@ -1147,6 +1197,56 @@
       interval: next.interval
     }).catch(function () { /* журнал не критичен */ });
     return next;
+  }
+
+  /* Сессия обучения: раунды как в Quizlet — короткие круги по 7 элементов,
+     каждый круг доучивается до конца, а не «один проход и до завтра». */
+  var ROUND_SIZE = 7;
+  var MAX_ROUNDS = 3;
+  var NEW_PER_SESSION = 14;   // два полных круга новых за раз
+
+  /**
+   * Набирает элементы сессии: сначала повторения на сегодня, потом немного
+   * новых. Если на сегодня ничего не запланировано — берёт ближайшие по сроку
+   * и помечает сессию досрочной (расписание от неё не пострадает).
+   */
+  function buildSession(items, todayStr) {
+    var limit = ROUND_SIZE * MAX_ROUNDS;
+    var due = items.filter(function (it) { return SRS.isDue(it.progress, todayStr); });
+    var reviews = shuffle(due.filter(function (it) { return it.progress.lastReviewed; }));
+    var fresh = shuffle(due.filter(function (it) { return !it.progress.lastReviewed; }));
+    var picked = reviews.slice(0, limit);
+    picked = picked.concat(fresh.slice(0, Math.min(limit - picked.length, NEW_PER_SESSION)));
+    var ahead = false;
+    if (!picked.length) {
+      ahead = true;
+      picked = items.slice().sort(function (a, b) {
+        return String(a.progress.dueDate || '').localeCompare(String(b.progress.dueDate || ''));
+      }).slice(0, limit);
+    }
+    return {
+      items: shuffle(picked),
+      ahead: ahead,
+      dueTotal: due.length,
+      leftOver: Math.max(0, due.length - picked.length)
+    };
+  }
+
+  /** Варианты для вопроса с выбором: правильный ответ + 3 чужих. */
+  function choiceOptions(cardList, card, dir) {
+    var correct = backOf(card, dir);
+    var seen = {};
+    seen[normalizeAnswer(correct)] = true;
+    var others = [];
+    shuffle(cardList).forEach(function (c) {
+      if (c.id === card.id || others.length >= 3) return;
+      var text = backOf(c, dir);
+      var key = normalizeAnswer(text);
+      if (!text || seen[key]) return;
+      seen[key] = true;
+      others.push(text);
+    });
+    return others.length >= 3 ? shuffle([correct].concat(others)) : null;
   }
 
   function screenFlashcards(deckId) {
@@ -1365,172 +1465,374 @@
     return DB.ensureProgress(deckId).then(function () {
       return Promise.all([DB.getDeck(deckId), DB.listCards(deckId), DB.getDeckProgress(deckId)]);
     }).then(function (res) {
-      var deck = res[0], list = res[1];
+      var deck = res[0], cardList = res[1];
       if (!deck) return notFound();
-      if (!list.length) return emptyStudy(deckId, 'В наборе нет карточек', 'Добавьте карточки, чтобы начать.');
+      if (!cardList.length) {
+        return emptyStudy(deckId, 'В наборе нет карточек', 'Добавьте карточки, чтобы начать.');
+      }
 
       var dirs = DB.directionsOf(deck);
-      var items = buildItems(list, res[2], dirs);
+      var all = buildItems(cardList, res[2], dirs);
       var today = DB.today();
-      var due = items.filter(function (it) { return SRS.isDue(it.progress, today); });
+      var session = buildSession(all, today);
+      var rateOpts = { keepLaterDue: session.ahead };
+      var root = el('<div class="study"></div>');
+      var keyHandler = null;
+      var timer = null;
 
-      if (!due.length) {
-        var next = items.map(function (it) { return it.progress && it.progress.dueDate; })
-          .filter(Boolean).sort()[0];
-        var hint = next
-          ? 'Следующее повторение — ' + next + ' (через ' + DB.daysBetween(today, next) + ' дн.).'
-          : 'Возвращайтесь позже.';
-        return {
-          el: emptyState({
-            icon: 'check',
-            title: 'На сегодня всё повторено',
-            text: hint,
-            buttons: [
-              {
-                label: 'Пролистать карточки', cls: 'btn--primary',
-                onClick: function () { App.go('#/deck/' + deckId + '/flashcards'); }
-              },
-              { label: 'К набору', cls: 'btn--ghost', onClick: function () { App.go('#/deck/' + deckId); } }
-            ]
-          }),
-          title: 'Учить',
-          back: '#/deck/' + deckId
-        };
+      function setKeys(handler) {
+        if (keyHandler) document.removeEventListener('keydown', keyHandler);
+        keyHandler = handler;
+        if (handler) document.addEventListener('keydown', handler);
       }
 
-      var queue = shuffle(due);
-      var total = due.length;
-      var index = 0;
-      var doneKeys = {};
-      var doneCount = 0;
-      var againCount = 0;
-      var revealed = false;
+      function cleanup() {
+        if (keyHandler) document.removeEventListener('keydown', keyHandler);
+        clearTimeout(timer);
+      }
 
-      var root = el('<div class="study"></div>');
-      var head = el('<div class="study__head">' +
-        '<div class="study__counter"><span data-pos></span><span data-left></span></div>' +
-        '<div class="progress"><div class="progress__bar"></div></div></div>');
-      var card = el('<div class="flashcard"><div class="flashcard__inner">' +
-        '<div class="flashcard__face flashcard__face--front">' +
-        '<div class="flashcard__kicker" data-front-kicker></div>' +
-        '<div class="flashcard__text" data-front></div>' +
-        '<div class="flashcard__hint">Вспомните ответ и нажмите «Показать»</div>' +
-        '</div>' +
-        '<div class="flashcard__face flashcard__face--back">' +
-        '<div class="flashcard__kicker" data-front-small></div>' +
-        '<div class="flashcard__text flashcard__text--answer" data-back></div>' +
-        '<img class="flashcard__img" data-img alt="" hidden>' +
-        '</div></div></div>');
-      var showBtn = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
-        icon('eye') + ' Показать ответ</button>');
-      var ratings = el('<div class="rating-grid" hidden></div>');
+      /* ---------------------------------------------------------- общее */
 
-      SRS.RATINGS.forEach(function (rating) {
-        var btn = el('<button type="button" class="rating rating--' + rating + '" data-rating="' + rating + '">' +
-          '<span class="rating__label">' + SRS.LABELS[rating] + '</span>' +
-          '<span class="rating__interval" data-interval></span></button>');
-        on(btn, 'click', function () { rate(rating); });
-        ratings.appendChild(btn);
-      });
+      function headNode(doneCount, total, right) {
+        return el('<div class="study__head">' +
+          '<div class="study__counter"><span>Изучено ' + doneCount + ' из ' + total + '</span>' +
+          '<span>' + esc(right) + '</span></div>' +
+          '<div class="progress"><div class="progress__bar" style="width:' +
+          (total ? doneCount / total * 100 : 0) + '%"></div></div></div>');
+      }
 
-      root.appendChild(head);
-      root.appendChild(card);
-      root.appendChild(showBtn);
-      root.appendChild(ratings);
+      /** Итог сессии: сколько осталось на сегодня и что делать дальше. */
+      function sessionDone(stats) {
+        setKeys(null);
+        DB.getDeckProgress(deckId).then(function (fresh) {
+          var left = buildItems(cardList, fresh, dirs)
+            .filter(function (it) { return SRS.isDue(it.progress, DB.today()); }).length;
+          root.innerHTML = '';
+          var perfect = !stats.mistakes;
+          root.appendChild(el('<div class="summary">' +
+            '<div class="summary__emoji">' + (perfect ? '🎉' : '👍') + '</div>' +
+            '<div class="summary__title">' + (session.ahead ? 'Тренировка завершена' : 'Раунды пройдены') + '</div>' +
+            '<div class="summary__score">' + stats.learned + '</div>' +
+            '<div class="muted small">' +
+            plural(stats.learned, 'термин изучен', 'термина изучено', 'терминов изучено') +
+            (stats.mistakes ? ' · ошибок: ' + stats.mistakes : ' · без ошибок') + '</div>' +
+            '</div>'));
 
-      function current() { return queue[index]; }
+          if (left) {
+            var more = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
+              icon('bolt') + ' Учить дальше · ' + left + '</button>');
+            on(more, 'click', function () { App.refresh(); });
+            root.appendChild(more);
+          } else {
+            var again = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
+              icon('refresh') + ' Повторить ещё раз</button>');
+            on(again, 'click', function () { App.refresh(); });
+            root.appendChild(again);
+            root.appendChild(el('<p class="small muted center">На сегодня всё повторено. ' +
+              'Можно тренироваться дальше — досрочные ответы не сбивают расписание.</p>'));
+          }
 
-      function render() {
-        var item = current();
-        if (!item) return finish();
-        revealed = false;
-        card.classList.remove('is-flipped');
-        showBtn.hidden = false;
-        ratings.hidden = true;
-        var front = frontOf(item.card, item.dir);
-        $('[data-front-kicker]', card).textContent = frontKicker(item.dir);
-        $('[data-front]', card).textContent = front;
-        $('[data-front-small]', card).textContent = front;
-        $('[data-back]', card).textContent = backOf(item.card, item.dir);
-        var img = $('[data-img]', card);
-        if (item.card.image) { img.src = item.card.image; img.hidden = false; }
-        else { img.hidden = true; img.removeAttribute('src'); }
+          var back = el('<button type="button" class="btn btn--block">К набору</button>');
+          on(back, 'click', function () { App.go('#/deck/' + deckId); });
+          root.appendChild(back);
+        });
+      }
 
-        var p = item.progress || DB.newProgressRecord(item.card.id, deckId, item.dir);
-        $$('[data-rating]', ratings).forEach(function (btn) {
-          var rating = btn.getAttribute('data-rating');
-          $('[data-interval]', btn).textContent = SRS.formatInterval(SRS.previewInterval(p, rating));
+      /* ------------------------------------- режим «проверка ответов» */
+
+      function startQuiz() {
+        var entries = session.items.map(function (item) {
+          // Выученную карточку (интервал больше 21 дня) не гоняем через выбор
+          // из вариантов — сразу просим написать ответ.
+          var stage = SRS.stateOf(item.progress) === 'mature' ? 1 : 0;
+          return { item: item, stage: stage, mistakes: 0 };
+        });
+        var total = entries.length;
+        var learned = 0;
+        var mistakes = 0;
+        var rounds = [];
+        for (var i = 0; i < entries.length; i += ROUND_SIZE) {
+          rounds.push(entries.slice(i, i + ROUND_SIZE));
+        }
+        var roundIndex = 0;
+        var queue = [];
+
+        function roundLabel() {
+          return (session.ahead ? 'досрочно · ' : '') +
+            'круг ' + (roundIndex + 1) + ' из ' + rounds.length;
+        }
+
+        function startRound() {
+          queue = shuffle(rounds[roundIndex].slice());
+          nextQuestion();
+        }
+
+        /** Возвращает карточку в очередь через несколько вопросов. */
+        function requeue(entry, gap) {
+          var pos = Math.min(queue.length, gap + Math.floor(Math.random() * 2));
+          queue.splice(pos, 0, entry);
+        }
+
+        function finishEntry(entry) {
+          // Итог по карточке переводим в оценку SM-2: без ошибок — «хорошо»,
+          // одна ошибка — «трудно», больше — «снова» (вернётся сегодня же).
+          var rating = entry.mistakes === 0 ? 'good' : (entry.mistakes === 1 ? 'hard' : 'again');
+          applyRating(deckId, entry.item, rating, rateOpts);
+          learned++;
+        }
+
+        function answered(entry, correct) {
+          if (correct) {
+            entry.stage++;
+            queue.shift();
+            if (entry.stage >= 2) finishEntry(entry);
+            else requeue(entry, 2);
+          } else {
+            mistakes++;
+            entry.mistakes++;
+            entry.stage = 0;
+            queue.shift();
+            requeue(entry, 1);
+          }
+        }
+
+        function roundDone() {
+          setKeys(null);
+          roundIndex++;
+          if (roundIndex >= rounds.length) {
+            return sessionDone({ learned: learned, mistakes: mistakes });
+          }
+          root.innerHTML = '';
+          root.appendChild(el('<div class="summary">' +
+            '<div class="summary__emoji">✅</div>' +
+            '<div class="summary__title">Круг ' + roundIndex + ' пройден</div>' +
+            '<div class="summary__score">' + learned + ' / ' + total + '</div>' +
+            '<div class="muted small">Осталось кругов: ' + (rounds.length - roundIndex) + '</div></div>'));
+          var next = el('<button type="button" class="btn btn--primary btn--block btn--lg">Продолжить</button>');
+          on(next, 'click', startRound);
+          root.appendChild(next);
+          setKeys(function (e) {
+            if (e.key === 'Enter' || e.code === 'Space') { e.preventDefault(); startRound(); }
+          });
+        }
+
+        function nextQuestion() {
+          if (!queue.length) return roundDone();
+          renderQuestion(queue[0]);
+        }
+
+        function renderQuestion(entry) {
+          var item = entry.item;
+          var options = entry.stage === 0 ? choiceOptions(cardList, item.card, item.dir) : null;
+          var expected = backOf(item.card, item.dir);
+
+          root.innerHTML = '';
+          root.appendChild(headNode(learned, total, roundLabel()));
+          root.appendChild(el('<div class="question">' +
+            '<div class="question__kicker">' +
+            (options ? 'выберите ' : 'напишите ') + backKicker(item.dir) + '</div>' +
+            '<div class="question__text">' + esc(frontOf(item.card, item.dir)) + '</div></div>'));
+
+          var area = el('<div class="stack"></div>');
+          root.appendChild(area);
+
+          /** Показывает вердикт и ведёт к следующему вопросу. */
+          function reveal(correct, given) {
+            answered(entry, correct);
+            var verdict = el('<div class="verdict ' + (correct ? 'verdict--ok' : 'verdict--no') + '">' +
+              icon(correct ? 'check' : 'close') +
+              '<span class="grow">' + (correct
+                ? 'Верно!'
+                : 'Правильный ответ: <span class="verdict__answer">' + esc(expected) + '</span>' +
+                  (given ? '<br><span class="small">вы ответили: ' + esc(given) + '</span>' : '')) +
+              '</span></div>');
+            area.appendChild(verdict);
+            $$('button, input', area).forEach(function (b) { b.disabled = true; });
+
+            var next = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
+              (correct ? 'Дальше' : 'Понятно, дальше') + '</button>');
+            next.disabled = false;
+            on(next, 'click', function () { clearTimeout(timer); nextQuestion(); });
+            area.appendChild(next);
+            setKeys(function (e) {
+              if (e.key === 'Enter' || e.code === 'Space') {
+                e.preventDefault();
+                clearTimeout(timer);
+                nextQuestion();
+              }
+            });
+            // верный ответ не задерживаем — как в Quizlet, идём дальше сами
+            if (correct) timer = setTimeout(nextQuestion, 900);
+          }
+
+          if (options) {
+            var box = el('<div class="options"></div>');
+            options.forEach(function (text, i) {
+              var btn = el('<button type="button" class="option"><span class="option__mark"></span>' +
+                '<span class="grow">' + esc(text) + '</span></button>');
+              on(btn, 'click', function () {
+                var correct = normalizeAnswer(text) === normalizeAnswer(expected);
+                $$('.option', box).forEach(function (b) { b.classList.add('option--disabled'); });
+                btn.classList.add(correct ? 'option--correct' : 'option--wrong');
+                $('.option__mark', btn).innerHTML = icon(correct ? 'check' : 'close');
+                if (!correct) {
+                  $$('.option', box).forEach(function (b, idx) {
+                    if (normalizeAnswer(options[idx]) === normalizeAnswer(expected)) {
+                      b.classList.add('option--correct');
+                      $('.option__mark', b).innerHTML = icon('check');
+                    }
+                  });
+                }
+                reveal(correct, text);
+              });
+              box.appendChild(btn);
+            });
+            area.appendChild(box);
+            setKeys(function (e) {
+              var n = parseInt(e.key, 10);
+              if (n >= 1 && n <= options.length) {
+                e.preventDefault();
+                $$('.option', box)[n - 1].click();
+              }
+            });
+          } else {
+            var form = el('<form class="stack" autocomplete="off">' +
+              '<input class="input" type="text" placeholder="Ваш ответ" enterkeyhint="done" ' +
+              'autocorrect="off" autocapitalize="none" spellcheck="false">' +
+              '<div class="btn-grid">' +
+              '<button type="button" class="btn" data-skip>Не знаю</button>' +
+              '<button type="submit" class="btn btn--primary">Ответить</button>' +
+              '</div></form>');
+            var input = $('input', form);
+            on(form, 'submit', function (e) {
+              e.preventDefault();
+              var value = input.value.trim();
+              if (!value) return;
+              reveal(answerMatches(value, expected), value);
+            });
+            on($('[data-skip]', form), 'click', function () { reveal(false, ''); });
+            area.appendChild(form);
+            setKeys(null);
+            setTimeout(function () { input.focus(); }, 60);
+          }
+        }
+
+        startRound();
+      }
+
+      /* ------------------------------------------ режим «самооценка» */
+
+      function startSelfMode() {
+        var queue = session.items.slice();
+        var total = queue.length;
+        var index = 0;
+        var doneKeys = {};
+        var learned = 0;
+        var againCount = 0;
+        var revealed = false;
+
+        var head = headNode(0, total, session.ahead ? 'досрочно' : 'самооценка');
+        var card = el('<div class="flashcard"><div class="flashcard__inner">' +
+          '<div class="flashcard__face flashcard__face--front">' +
+          '<div class="flashcard__kicker" data-front-kicker></div>' +
+          '<div class="flashcard__text" data-front></div>' +
+          '<div class="flashcard__hint">Вспомните ответ и нажмите «Показать»</div>' +
+          '</div>' +
+          '<div class="flashcard__face flashcard__face--back">' +
+          '<div class="flashcard__kicker" data-front-small></div>' +
+          '<div class="flashcard__text flashcard__text--answer" data-back></div>' +
+          '<img class="flashcard__img" data-img alt="" hidden>' +
+          '</div></div></div>');
+        var showBtn = el('<button type="button" class="btn btn--primary btn--block btn--lg">' +
+          icon('eye') + ' Показать ответ</button>');
+        var ratings = el('<div class="rating-grid" hidden></div>');
+
+        SRS.RATINGS.forEach(function (rating) {
+          var btn = el('<button type="button" class="rating rating--' + rating + '" data-rating="' + rating + '">' +
+            '<span class="rating__label">' + SRS.LABELS[rating] + '</span>' +
+            '<span class="rating__interval" data-interval></span></button>');
+          on(btn, 'click', function () { rate(rating); });
+          ratings.appendChild(btn);
         });
 
-        $('[data-pos]', head).textContent = 'Осталось: ' + (queue.length - index);
-        $('[data-left]', head).textContent = 'Готово: ' + doneCount + ' из ' + total;
-        $('.progress__bar', head).style.width = (doneCount / total * 100) + '%';
-      }
+        root.appendChild(head);
+        root.appendChild(card);
+        root.appendChild(showBtn);
+        root.appendChild(ratings);
 
-      function reveal() {
-        if (revealed) return;
-        revealed = true;
-        card.classList.add('is-flipped');
-        showBtn.hidden = true;
-        ratings.hidden = false;
-      }
+        function render() {
+          var item = queue[index];
+          if (!item) return sessionDone({ learned: learned, mistakes: againCount });
+          revealed = false;
+          card.classList.remove('is-flipped');
+          showBtn.hidden = false;
+          ratings.hidden = true;
+          var front = frontOf(item.card, item.dir);
+          $('[data-front-kicker]', card).textContent = frontKicker(item.dir);
+          $('[data-front]', card).textContent = front;
+          $('[data-front-small]', card).textContent = front;
+          $('[data-back]', card).textContent = backOf(item.card, item.dir);
+          var img = $('[data-img]', card);
+          if (item.card.image) { img.src = item.card.image; img.hidden = false; }
+          else { img.hidden = true; img.removeAttribute('src'); }
 
-      function rate(rating) {
-        var item = current();
-        if (!item || !revealed) return;
-        applyRating(deckId, item, rating);
-        var key = itemKey(item);
-        if (rating === 'again') {
-          againCount++;
-          // вернуть карточку в очередь, но не следующей же
-          queue.splice(Math.min(index + 3, queue.length), 0, item);
-        } else if (!doneKeys[key]) {
-          doneKeys[key] = true;
-          doneCount++;
+          var p = item.progress || DB.newProgressRecord(item.card.id, deckId, item.dir);
+          $$('[data-rating]', ratings).forEach(function (btn) {
+            var rating = btn.getAttribute('data-rating');
+            $('[data-interval]', btn).textContent = SRS.formatInterval(SRS.previewInterval(p, rating));
+          });
+
+          $('.study__counter span', head).textContent = 'Изучено ' + learned + ' из ' + total;
+          $('.progress__bar', head).style.width = (learned / total * 100) + '%';
         }
-        index++;
+
+        function reveal() {
+          if (revealed) return;
+          revealed = true;
+          card.classList.add('is-flipped');
+          showBtn.hidden = true;
+          ratings.hidden = false;
+        }
+
+        function rate(rating) {
+          var item = queue[index];
+          if (!item || !revealed) return;
+          applyRating(deckId, item, rating, rateOpts);
+          var key = itemKey(item);
+          if (rating === 'again') {
+            againCount++;
+            queue.splice(Math.min(index + 3, queue.length), 0, item);
+          } else if (!doneKeys[key]) {
+            doneKeys[key] = true;
+            learned++;
+          }
+          index++;
+          render();
+        }
+
+        on(showBtn, 'click', reveal);
+        on(card, 'click', reveal);
+        setKeys(function (e) {
+          if (e.target.matches('input, textarea')) return;
+          if (!revealed && (e.code === 'Space' || e.key === 'Enter')) { e.preventDefault(); reveal(); return; }
+          if (!revealed) return;
+          var map = { '1': 'again', '2': 'hard', '3': 'good', '4': 'easy' };
+          if (map[e.key]) { e.preventDefault(); rate(map[e.key]); }
+          else if (e.code === 'Space') { e.preventDefault(); rate('good'); }
+        });
+
         render();
       }
 
-      function finish() {
-        root.innerHTML = '';
-        var summary = el('<div class="summary">' +
-          '<div class="summary__emoji">🎉</div>' +
-          '<div class="summary__title">Повторение завершено</div>' +
-          '<div class="summary__score">' + doneCount + '</div>' +
-          '<div class="muted small">' + plural(doneCount, 'карточка отправлена', 'карточки отправлены', 'карточек отправлено') +
-          ' на следующий круг' + (againCount ? ' · «снова»: ' + againCount : '') + '</div>' +
-          '</div>');
-        root.appendChild(summary);
-        var back = el('<button type="button" class="btn btn--primary btn--block btn--lg">К набору</button>');
-        on(back, 'click', function () { App.go('#/deck/' + deckId); });
-        var home = el('<button type="button" class="btn btn--ghost btn--block">Ко всем наборам</button>');
-        on(home, 'click', function () { App.go('#/'); });
-        root.appendChild(back);
-        root.appendChild(home);
-      }
-
-      on(showBtn, 'click', reveal);
-      on(card, 'click', reveal);
-
-      function onKey(e) {
-        if (e.target.matches('input, textarea')) return;
-        if (!revealed && (e.code === 'Space' || e.key === 'Enter')) { e.preventDefault(); reveal(); return; }
-        if (!revealed) return;
-        var map = { '1': 'again', '2': 'hard', '3': 'good', '4': 'easy' };
-        if (map[e.key]) { e.preventDefault(); rate(map[e.key]); }
-        else if (e.code === 'Space') { e.preventDefault(); rate('good'); }
-      }
-      document.addEventListener('keydown', onKey);
-
-      render();
+      if ((deck.learnMode || 'quiz') === 'self') startSelfMode();
+      else startQuiz();
 
       return {
         el: root,
         title: 'Учить · ' + deck.name,
         back: '#/deck/' + deckId,
         study: true,
-        destroy: function () { document.removeEventListener('keydown', onKey); }
+        destroy: cleanup
       };
     });
   }
@@ -1917,7 +2219,11 @@
 
       root.appendChild(statGrid(sum));
       root.appendChild(el('<div class="card card--pad stack">' +
-        '<div class="row"><div class="grow list__title">Состояние карточек</div>' +
+        '<div class="row"><div class="grow list__title">Освоение</div>' +
+        '<div class="mastery__value">' + sum.mastery + '%</div></div>' +
+        '<div class="progress progress--lg"><div class="progress__bar" style="width:' +
+        sum.mastery + '%"></div></div>' +
+        '<div class="row"><div class="grow small muted">Состояние карточек</div>' +
         '<span class="badge badge--due">' + sum.due + ' к повтору</span></div></div>'));
       $('.card--pad', root).appendChild(splitBar(sum));
       $('.card--pad', root).appendChild(el('<p class="small muted">Выученной считается карточка ' +
@@ -1953,8 +2259,8 @@
             ? ' · ' + DIRECTION_SHORT[deck.direction] : '';
           var row = el('<div class="list__row"><div class="list__main">' +
             '<div class="list__title">' + esc(deck.name) + '</div>' +
-            '<div class="list__sub">выучено ' + s.mature + ' · изучаю ' + s.learning +
-            ' · новых ' + s.fresh + dirNote + '</div></div>' +
+            '<div class="list__sub">освоено ' + s.mastery + '% · выучено ' + s.mature +
+            ' · изучаю ' + s.learning + ' · новых ' + s.fresh + dirNote + '</div></div>' +
             (s.due ? '<span class="badge badge--due">' + s.due + '</span>' : '') +
             '<svg viewBox="0 0 24 24" class="chevron" aria-hidden="true"><path d="' + ICONS.forward + '"/></svg></div>');
           on(row, 'click', function () { App.go('#/deck/' + deck.id); });

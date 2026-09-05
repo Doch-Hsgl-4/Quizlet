@@ -417,6 +417,15 @@ svg {
   overflow: hidden;
 }
 
+.progress--lg { height: 10px; }
+
+.mastery__value {
+  font-size: 20px;
+  font-weight: 750;
+  letter-spacing: -.02em;
+  color: var(--primary);
+}
+
 .progress__bar {
   height: 100%;
   width: 0;
