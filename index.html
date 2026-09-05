@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Карточки</title>
+<meta name="description" content="Офлайн-приложение для изучения карточек с интервальным повторением">
+
+<!-- PWA -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#4f46e5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1117" media="(prefers-color-scheme: dark)">
+
+<!-- iOS: запуск с домашнего экрана как отдельное приложение -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Карточки">
+<meta name="format-detection" content="telephone=no">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="app">
+  <header class="topbar" id="topbar">
+    <button class="topbar__btn" id="btn-back" type="button" aria-label="Назад" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <h1 class="topbar__title" id="topbar-title">Карточки</h1>
+    <div class="topbar__actions" id="topbar-actions"></div>
+  </header>
+
+  <main class="screen" id="app" tabindex="-1">
+    <div class="loader"><span class="spinner"></span></div>
+  </main>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<div class="modal-root" id="modal-root"></div>
+
+<noscript>
+  <p style="padding:24px;text-align:center">Для работы приложения нужен JavaScript.</p>
+</noscript>
+
+<script src="js/db.js"></script>
+<script src="js/srs.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
